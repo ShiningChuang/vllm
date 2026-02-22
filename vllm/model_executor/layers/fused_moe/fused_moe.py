@@ -1494,6 +1494,14 @@ def fused_experts(hidden_states: torch.Tensor,
             w2_bias=w2_bias,
         )
 
+# lxzhong: This function is used to log in the MoE kernel for analysis purposes. 
+def _maybe_log_moe_shapes(record: dict):
+    if os.environ.get("VLLM_LOG_MOE_SHAPES", "0") != "1":
+        return
+    rank = int(os.environ.get("RANK", "0"))
+    path = f"/tmp/moe_shapes_rank{rank}.jsonl"
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
 
 def fused_experts_impl(
     hidden_states: torch.Tensor,
@@ -1643,6 +1651,41 @@ def fused_experts_impl(
             moe_align_block_size(curr_topk_ids, config['BLOCK_SIZE_M'],
                                  global_num_experts, expert_map))
 
+        # lxzhong
+        # 1) tokens-per-expert（assignment）
+        # curr_topk_ids: [tokens_in_chunk, topk]
+        flat = curr_topk_ids.reshape(-1).to(torch.int64)
+        counts = torch.bincount(flat, minlength=global_num_experts)  # on GPU
+        counts_cpu = counts.detach().cpu().tolist()
+
+        # 2) kernel real EM
+        EM = int(sorted_token_ids.size(0))
+        post_padded = int(num_tokens_post_padded.item())
+        # num_tokens_post_padded <= EM
+
+        # 3)  N/K/hidden of GEMM1 / GEMM2
+        hidden = int(curr_hidden_states.size(1))
+        N1 = int(w1.size(1))    
+        K2 = int(w2.size(1))         
+        N2 = int(w2.size(2))     
+
+        rec = {
+            "where": "after_align_before_gemm1",
+            "chunk": chunk,
+            "begin": int(begin_chunk_idx),
+            "end": int(end_chunk_idx),
+            "tokens_in_chunk": int(tokens_in_chunk),
+            "topk": int(top_k_num),
+            "global_num_experts": int(global_num_experts),
+            "EM_sorted_token_ids": EM,
+            "num_tokens_post_padded": post_padded,
+            "config": {k: int(v) for k, v in config.items() if isinstance(v, (int,))},
+            "gemm1": {"A": [int(tokens_in_chunk), hidden], "B": [hidden, N1]},
+            "gemm2": {"A": ["M_e", N2], "B": [N2, K2]},
+            "tokens_per_expert_assign": counts_cpu,
+        }
+        _maybe_log_moe_shapes(rec)
+        
         invoke_fused_moe_kernel(qcurr_hidden_states,
                                 w1,
                                 intermediate_cache1,
