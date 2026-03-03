@@ -737,6 +737,82 @@ def get_compressed_expert_map(expert_map: torch.Tensor) -> str:
         for local_index, global_index in zip(local_indices, global_indices))
 
 
+def shape_aware_replica_selection(
+    topk_ids_long: torch.Tensor,
+    logical_to_physical_map: torch.Tensor,
+    logical_replica_count: torch.Tensor,
+    block_size: int = 64,
+    rank_id: int = 0,
+) -> torch.Tensor:
+    """Select expert replicas to minimize total padded GEMM blocks.
+
+    Instead of random replica selection, assigns tokens to replicas by
+    filling each replica up to ``block_size`` slots before switching to
+    the next.  This consolidates tokens onto fewer replicas and avoids
+    creating extra half-empty blocks.
+
+    ``rank_id`` is used to offset the starting replica so that different
+    source ranks prefer different replicas.  Without this offset every rank
+    would fill replica-0 first, concentrating all traffic on whichever
+    physical expert holds replica-0 (herd effect) and producing *more*
+    padding waste at the destination rank after the all-to-all dispatch.
+    With the offset, rank k fills starting from replica (k % r), spreading
+    load evenly across replicas.
+
+    Example (block_size=128, 2 replicas, 100 tokens):
+        Random split 50/50  -> ceil(50/128) + ceil(50/128) = 1 + 1 = 2 blocks
+        Consolidated 100/0  -> ceil(100/128) + 0           = 1 + 0 = 1 block
+
+    Args:
+        topk_ids_long: Logical expert ids, shape [num_tokens, top_k].
+        logical_to_physical_map: Shape [num_logical_experts, max_replicas].
+        logical_replica_count: Number of replicas per logical expert,
+            shape [num_logical_experts].
+        block_size: GEMM tile size (BLOCK_SIZE_M).  Tokens are consolidated
+            within each replica until this many slots are filled.
+        rank_id: EP rank of the current node.  Used to rotate the starting
+            replica index so different ranks prefer different replicas.
+
+    Returns:
+        replica_indices: Shape [num_tokens, top_k, 1], dtype long.
+            Use with ``.gather(-1, replica_indices)`` on the physical map.
+    """
+    flat_ids = topk_ids_long.flatten()  # [N]
+    N = flat_ids.shape[0]
+    num_logical = logical_replica_count.shape[0]
+
+    # Sort tokens by logical expert id so that all tokens of the same
+    # expert are contiguous.
+    sort_idx = torch.argsort(flat_ids, stable=True)
+    sorted_expert = flat_ids[sort_idx]  # [N]
+
+    # Compute the start offset in the sorted array for each expert.
+    # expert_start[e] = index of the first token assigned to expert e.
+    expert_start = torch.zeros(num_logical + 1,
+                               dtype=torch.long,
+                               device=flat_ids.device)
+    ones = torch.ones(N, dtype=torch.long, device=flat_ids.device)
+    expert_start.scatter_add_(0, sorted_expert + 1, ones)
+    expert_start = expert_start.cumsum(0)  # [num_logical + 1]
+
+    # intra_pos[i] = position of sorted token i within its expert group.
+    intra_pos = torch.arange(N, device=flat_ids.device) \
+        - expert_start[sorted_expert]  # [N]
+
+    # Replica assignment: fill block_size tokens per replica before moving
+    # on, starting from replica (rank_id % r) so that different source ranks
+    # fill different replicas first, avoiding the herd effect where all ranks
+    # concentrate traffic on replica-0.
+    r = logical_replica_count[sorted_expert]  # [N]
+    replica_in_sorted = (intra_pos // block_size + rank_id) % r  # [N]
+
+    # Restore the original token ordering.
+    replica_flat = torch.empty(N, dtype=torch.long, device=flat_ids.device)
+    replica_flat[sort_idx] = replica_in_sorted
+
+    return replica_flat.reshape(topk_ids_long.shape).unsqueeze(-1)
+
+
 @CustomOp.register("fused_moe")
 class FusedMoE(CustomOp):
     """FusedMoE layer for MoE models.
@@ -1456,6 +1532,7 @@ class FusedMoE(CustomOp):
         expert_load_view: Optional[torch.Tensor] = None,
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
+        block_size: int = 64,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Route the input hidden states to the top-k experts based on the
@@ -1482,7 +1559,9 @@ class FusedMoE(CustomOp):
                 indices_type=indices_type)
 
         # DeepSeekv2 uses grouped_top_k
+        # print("[select_experts] before use use_grouped_topk")
         if use_grouped_topk:
+            # print("[select_experts] use_grouped_topk")
             assert topk_group is not None
             assert num_expert_group is not None
             topk_weights, topk_ids = grouped_topk(
@@ -1520,17 +1599,32 @@ class FusedMoE(CustomOp):
             assert logical_replica_count is not None
 
             # 1. Convert the logical expert ids to physical expert ids
-            # Directly select a random replica for each logical expert
-
-            # TODO: maybe optimize this by using specified kernels,
-            # or compute pseudo-random indices by modulo
 
             # In case `indices_type` is not `torch.long` or `torch.int`,
             # e.g. `torch.uint32` as required by dispatch/combine kernels
             topk_ids_long = topk_ids.long()
-            replica_indices = (
-                torch.rand_like(topk_ids, dtype=torch.float) *
-                logical_replica_count[topk_ids_long]).long().unsqueeze(-1)
+            if envs.VLLM_MOE_SHAPE_AWARE_ROUTING:
+                # Shape-aware: consolidate tokens onto fewer replicas to
+                # minimize padded GEMM blocks / waves.
+                # Set VLLM_MOE_SHAPE_AWARE_ROUTING=1 to enable.
+                #
+                # Pass the EP rank so that each source rank starts filling
+                # from a different replica, preventing all ranks from
+                # flooding the same replica-0 (herd effect).
+                replica_indices = shape_aware_replica_selection(
+                    topk_ids_long,
+                    logical_to_physical_map,
+                    logical_replica_count,
+                    block_size=block_size,
+                    rank_id=get_ep_group().rank_in_group,
+                )
+            else:
+                # Default: randomly select a replica for each logical expert.
+                # TODO: maybe optimize this by using specified kernels,
+                # or compute pseudo-random indices by modulo
+                replica_indices = (
+                    torch.rand_like(topk_ids, dtype=torch.float) *
+                    logical_replica_count[topk_ids_long]).long().unsqueeze(-1)
             physical_ids = logical_to_physical_map[topk_ids_long].gather(
                 -1, replica_indices).squeeze(-1)
 

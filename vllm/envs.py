@@ -124,6 +124,9 @@ if TYPE_CHECKING:
     VLLM_DP_MASTER_IP: str = ""
     VLLM_DP_MASTER_PORT: int = 0
     VLLM_MOE_DP_CHUNK_SIZE: int = 256
+    VLLM_MOE_SHAPE_AWARE_ROUTING: bool = False
+    VLLM_LOG_MOE_SHAPES: bool = False
+    VLLM_LOG_MOE_RUN_ID: int = 0
     VLLM_RANDOMIZE_DP_DUMMY_INPUTS: bool = False
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
     VLLM_MXFP4_USE_MARLIN: Optional[bool] = None
@@ -1104,6 +1107,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Note: custom strategies may not produce correct model outputs
     "VLLM_MOE_ROUTING_SIMULATION_STRATEGY":
     lambda: os.environ.get("VLLM_MOE_ROUTING_SIMULATION_STRATEGY", "").lower(),
+
+    # If True, use shape-aware replica selection when EPLB is enabled.
+    # Assigns tokens to expert replicas by filling each replica up to
+    # block_size before switching, minimizing padded GEMM blocks.
+    # If False (default), replica selection is random.
+    "VLLM_MOE_SHAPE_AWARE_ROUTING":
+    lambda: os.environ.get("VLLM_MOE_SHAPE_AWARE_ROUTING", "0") == "1",
+
+    # If set to 1, log MoE kernel shapes (token counts per expert, GEMM
+    # dimensions, padding) to /tmp/moe_shapes_rank{rank}.jsonl for analysis.
+    "VLLM_LOG_MOE_SHAPES":
+    lambda: os.environ.get("VLLM_LOG_MOE_SHAPES", "0") == "1",
+
+    # Test run identifier for MoE shape logs. Set manually per test run to
+    # avoid mixing results from different runs. Each worker also appends its
+    # LOCAL_RANK, so the log file is:
+    #   /tmp/moe_shapes_run{VLLM_LOG_MOE_RUN_ID}_rank{LOCAL_RANK}.jsonl
+    "VLLM_LOG_MOE_RUN_ID":
+    lambda: int(os.environ.get("VLLM_LOG_MOE_RUN_ID", "0")),
 
     # Regex timeout for use by the vLLM tool parsing plugins.
     "VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS":

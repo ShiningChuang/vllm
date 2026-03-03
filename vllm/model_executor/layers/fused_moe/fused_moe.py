@@ -1496,10 +1496,9 @@ def fused_experts(hidden_states: torch.Tensor,
 
 # lxzhong: This function is used to log in the MoE kernel for analysis purposes. 
 def _maybe_log_moe_shapes(record: dict):
-    if os.environ.get("VLLM_LOG_MOE_SHAPES", "0") != "1":
+    if not envs.VLLM_LOG_MOE_SHAPES:
         return
-    rank = int(os.environ.get("RANK", "0"))
-    path = f"/tmp/moe_shapes_rank{rank}.jsonl"
+    path = f"/tmp/moe_shapes_run{envs.VLLM_LOG_MOE_RUN_ID}_rank{envs.LOCAL_RANK}.jsonl"
     with open(path, "a") as f:
         f.write(json.dumps(record) + "\n")
 
